@@ -109,7 +109,7 @@ class SystemStatus(Enum): STABLE = "stable"; WARNING = "warning"; CRITICAL = "cr
 class AshbyTalent(Enum): HOMEOSTAT = "homeostat"; VALIDATOR = "validator"; COUNTERFACTUAL = "counterfactual"; MUTATION = "mutation"; STRESS_HEAL = "stress_heal"
 
 DOMAIN_CONFIGS = {
-    "infrastructure": {"talents": [AshbyTalent.HOMEOSTAT, AshbyTalent.VALIDATOR, AshbyTalent.MUTATION]},
+   "infrastructure": {"talents": [AshbyTalent.HOMEOSTAT, AshbyTalent.VALIDATOR, AshbyTalent.MUTATION, AshbyTalent.COUNTERFACTUAL]},
     "healthcare": {"talents": [AshbyTalent.HOMEOSTAT, AshbyTalent.VALIDATOR, AshbyTalent.COUNTERFACTUAL]},
     "finance": {"talents": [AshbyTalent.HOMEOSTAT, AshbyTalent.COUNTERFACTUAL]},
     "history": {"talents": [AshbyTalent.COUNTERFACTUAL, AshbyTalent.STRESS_HEAL]}
