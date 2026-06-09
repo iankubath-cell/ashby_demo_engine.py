@@ -1,11 +1,12 @@
 """
-ASHBY-VIRA DEMO ENGINE v3.6 (PRODUCTION SECURED)
+ASHBY-VIRA DEMO ENGINE v3.7 (PRODUCTION SECURED + CORS ENABLED)
 Features:
 - API Key Authentication (X-API-Key header required)
+- CORS Enabled (Allows Base44 UI to connect)
 - Robust Error Handling (No unhandled 500s)
 - Thread-Safe State Management
 - Input Validation (Prevents type errors)
-- Future-Ready Architecture (Env vars, clean structure)
+- Future-Ready Architecture
 """
 
 import os
@@ -23,11 +24,10 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware  # <-- ADDED IMPORT FOR CORS
 from pydantic import BaseModel, validator
 
 # --- 1. SECURITY CONFIGURATION ---
-# Read API key from Environment Variable (Set in Render Dashboard)
-# Fallback to a default only for local dev if env var is missing.
 API_KEY_ENV = os.getenv("API_KEY", "dev-secret-key-change-me")
 
 security = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -420,7 +420,10 @@ class DemoCounterfactual:
 DEMO_SCENARIOS = {
     "power_temp": {"equations": {"Power": "0", "Temp": "2 * Power", "Shutdown": "1 if Temp > 100 else 0"}, "parents": {"Power": [], "Temp": ["Power"], "Shutdown": ["Temp"]}},
     "history_genghis": {"equations": {"Genghis": "1", "Empire": "100 * Genghis", "Trade": "50 + 20 * Empire", "Plague": "10 if Trade > 100 else 0"}, "parents": {"Genghis": [], "Empire": ["Genghis"], "Trade": ["Empire"], "Plague": ["Trade"]}},
-    "healthcare_dosage": {"equations": {"Dosage": "50", "BloodLevel": "2 * Dosage", "Effect": "BloodLevel * 0.5", "Toxicity": "1 if BloodLevel > 200 else 0"}, "parents": {"Dosage": [], "BloodLevel": ["Dosage"], "Effect": ["BloodLevel"], "Toxicity": ["BloodLevel"]}}
+    "healthcare_dosage": {
+        "equations": {"Dosage": "50", "BloodLevel": "2 * Dosage", "Effect": "BloodLevel * 0.5", "Toxicity": "1 if BloodLevel > 200 else 0"}, 
+        "parents": {"Dosage": [], "BloodLevel": ["Dosage"], "Effect": ["BloodLevel"], "Toxicity": ["BloodLevel"]}
+    }
 }
 
 # --- 9. PERSISTENCE ---
@@ -562,7 +565,16 @@ def handle_get_state() -> dict:
         }
 
 # --- 12. FASTAPI APP ---
-app = FastAPI(title="Ashby-Vira Demo Engine Secured", version="3.6")
+app = FastAPI(title="Ashby-Vira Demo Engine Secured", version="3.7")
+
+# --- ADD CORS MIDDLEWARE HERE ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (Base44, localhost, etc.)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers (including X-API-Key)
+)
 
 @app.post("/feedback")
 async def receive_feedback(payload: FeedbackEvent, authenticated: str = Depends(verify_api_key)):
@@ -591,8 +603,7 @@ async def heal_system(authenticated: str = Depends(verify_api_key)):
 
 @app.get("/")
 async def root():
-    # Public health check - no auth required
-    return {"message": "Ashby-Vira Demo Engine v3.6 (Secured) is running", "status": "healthy"}
+    return {"message": "Ashby-Vira Demo Engine v3.7 (Secured+CORS) is running", "status": "healthy"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
