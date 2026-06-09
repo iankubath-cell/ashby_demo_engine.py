@@ -420,7 +420,7 @@ class DemoCounterfactual:
 DEMO_SCENARIOS = {
     "power_temp": {"equations": {"Power": "0", "Temp": "2 * Power", "Shutdown": "1 if Temp > 100 else 0"}, "parents": {"Power": [], "Temp": ["Power"], "Shutdown": ["Temp"]}},
     "history_genghis": {"equations": {"Genghis": "1", "Empire": "100 * Genghis", "Trade": "50 + 20 * Empire", "Plague": "10 if Trade > 100 else 0"}, "parents": {"Genghis": [], "Empire": ["Genghis"], "Trade": ["Empire"], "Plague": ["Trade"]}},
-    "healthcare_dosage": {"equations": {"Dosage": "50", "BloodLevel": "2 * Dosage", "Effect": "BloodLevel * 0.5", "Toxicity": "1 if BloodLevel > 200 else 0"}, "parents": {"Dosage": [], "BloodLevel": ["Dosage"], "Effect": ["BloodLevel"], "Toxicity": ["BloodLevel"]}
+    "healthcare_dosage": {"equations": {"Dosage": "50", "BloodLevel": "2 * Dosage", "Effect": "BloodLevel * 0.5", "Toxicity": "1 if BloodLevel > 200 else 0"}, "parents": {"Dosage": [], "BloodLevel": ["Dosage"], "Effect": ["BloodLevel"], "Toxicity": ["BloodLevel"]}}
 }
 
 # --- 9. PERSISTENCE ---
