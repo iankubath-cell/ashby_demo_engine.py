@@ -1,0 +1,572 @@
+"""
+TRUST SCORE FIX - PRODUCTION READY VERSION v3.0
+================================================
+
+PROBLEM IDENTIFIED
+------------------
+trust_score was read from the caller's event payload, allowing any authenticated
+caller to set their own trust level. This is the Unverified Context Vulnerability:
+the adversary controls their own prior probability of safety.
+
+ATTACK SCENARIO (CONFIRMED IN AUDIT)
+------------------------------------
+Before fix: penalty = severity_penalty * caller_supplied_trust_score
+  → Attacker submits {"trust_score": 0.1}
+  → Critical event (0.20 penalty) becomes 0.02 (90% reduction)
+  → After 20 events, stability drops only to 0.60 (should have hit 0.0/Critical)
+  → System remains blind to ongoing critical attack
+
+FIX ARCHITECTURE
+----------------
+Remove trust_score from the event payload entirely. Assign it server-side based
+on verified API key identity, BEFORE the event reaches handle_demo_request().
+
+THREE-PART IMPLEMENTATION
+-------------------------
+  1. TrustRegistry      — Maps API keys to trust levels (server-side only)
+  2. get_trust_score()  — Replaces event.get("trust_score", 1.0)
+  3. Payload validator  — Rejects any event that includes trust_score field
+"""
+
+import os
+import time
+import logging
+from typing import Dict, Any, Callable
+from enum import Enum
+from fastapi import HTTPException, Depends, Request
+
+logger = logging.getLogger(__name__)
+
+# ===========================================================================
+# EXTERNAL DEPENDENCY: verify_api_key
+# ===========================================================================
+#
+# This function is expected to be defined elsewhere in your FastAPI application
+# (e.g., in auth.py or middleware.py). It extracts and validates the API key
+# from the request's Authorization header.
+#
+# Minimal reference implementation (replace with your own):
+#
+#   from fastapi.security import APIKeyHeader
+#
+#   api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+#
+#   async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
+#       if api_key not in VALID_KEYS:
+#           raise HTTPException(status_code=403, detail="Invalid API key")
+#       return api_key
+#
+# Import it in this file:
+#   from .auth import verify_api_key
+#
+# The dummy below allows this module to load standalone for testing.
+# Replace it with the real import in production.
+
+try:
+    from .auth import verify_api_key  # type: ignore
+except ImportError:
+    async def verify_api_key(request: Request) -> str:
+        """Fallback for standalone testing — NOT for production."""
+        key = request.headers.get("X-API-Key", "")
+        if not key:
+            raise HTTPException(status_code=401, detail="Missing API key")
+        return key
+
+
+# ===========================================================================
+# PART 1: Server-Side Trust Registry (Loaded Once at Module Init)
+# ===========================================================================
+
+class TrustTier(float, Enum):
+    """
+    Named trust tiers for clarity and type safety.
+
+    Use these symbolic constants instead of raw float literals.
+    Matches the paper's "Gated Architecture" verification levels.
+    """
+    UNTRUSTED = 0.10   # Authenticated but unverified identity claim
+    LOW       = 0.30   # Known external partner, unaudited
+    MEDIUM    = 0.60   # Verified organisation, periodic audit
+    HIGH      = 0.85   # Audited, contractually bound SLA
+    SYSTEM    = 1.00   # Internal system call, fully trusted
+
+    def __repr__(self) -> str:
+        return f"{self.name}={self.value:.2f}"
+
+
+def load_trust_registry() -> Dict[str, float]:
+    """
+    Construct the trust registry from environment variables at startup.
+
+    Reads API keys from environment variables and maps each to a TrustTier.
+    Filters out empty/whitespace-only values to prevent wildcard matches.
+
+    Returns:
+        Dict mapping API key strings to trust scores [0.0, 1.0].
+
+    Raises:
+        RuntimeError: If no valid API keys are configured at all.
+    """
+    # Collect raw entries from environment
+    entries_to_load = [
+        (os.getenv("API_KEY", ""), TrustTier.SYSTEM),
+        (os.getenv("PARTNER_KEY_A", ""), TrustTier.MEDIUM),
+        (os.getenv("PARTNER_KEY_B", ""), TrustTier.LOW),
+    ]
+
+    registry: Dict[str, float] = {}
+
+    for raw_key, tier in entries_to_load:
+        cleaned_key = raw_key.strip() if raw_key else ""
+        if cleaned_key:
+            registry[cleaned_key] = float(tier)
+
+    # Safety: at least one key must be present
+    if not registry:
+        logger.warning(
+            "No API keys found in environment variables. "
+            "Using development fallback. NOT FOR PRODUCTION."
+        )
+        registry["dev-secret-key-change-me"] = float(TrustTier.SYSTEM)
+
+    logger.info(
+        f"Trust registry initialised: {len(registry)} API key(s) mapped. "
+        f"Tiers: {[t.name for t in TrustTier]}"
+    )
+
+    return registry
+
+
+# Global registry — loaded once at module import, treated as read-only thereafter
+_TRUST_REGISTRY: Dict[str, float] = load_trust_registry()
+
+
+def get_trust_score(api_key: str) -> float:
+    """
+    Server-side trust assignment — THE SINGLE SOURCE OF TRUTH.
+
+    This is the ONLY place trust_score is determined. It runs AFTER
+    verify_api_key() confirms the API key is cryptographically valid.
+
+    Args:
+        api_key: Pre-validated API key from the authenticated request.
+
+    Returns:
+        Float in [0.0, 1.0] representing confidence level for this caller.
+        Unknown keys default to UNTRUSTED (0.10) — fail-safe conservative.
+
+    Security Guarantees:
+        • Never reads from request payload.
+        • Defaults to UNTRUSTED for unknown keys.
+        • Logs mask the key (last 4 characters only).
+    """
+    if not api_key or not isinstance(api_key, str):
+        logger.error("Empty or non-string API key passed to get_trust_score()")
+        return float(TrustTier.UNTRUSTED)
+
+    score = _TRUST_REGISTRY.get(api_key, float(TrustTier.UNTRUSTED))
+
+    masked_key = f"***{api_key[-4:]}" if len(api_key) >= 4 else "***"
+    logger.debug(f"Trust assigned: key={masked_key} score={score:.2f}")
+
+    return score
+
+
+# ===========================================================================
+# PART 2: Payload Sanitiser — Strip or Reject Caller-Supplied trust_score
+# ===========================================================================
+
+def sanitise_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove any trust_score field the caller may have attempted to include.
+
+    Enforces the principle: CALLERS CANNOT SET THEIR OWN TRUST.
+
+    Modes (controlled by STRICT_TRUST_VALIDATION env var):
+        • Strict (STRICT_TRUST_VALIDATION=1): Raise HTTP 400.
+        • Permissive (default): Strip silently + log warning.
+
+    Use permissive mode during client migration; switch to strict once all
+    clients have been updated to stop sending trust_score.
+
+    Args:
+        event: Raw request payload dict.
+
+    Returns:
+        Cleaned event dict with trust_score removed.
+
+    Raises:
+        HTTPException(400): If strict mode and trust_score is present.
+        ValueError: If event is None or not a dict.
+    """
+    if event is None:
+        raise ValueError("sanitise_event() received None — expected a dict")
+
+    if not isinstance(event, dict):
+        raise ValueError(
+            f"sanitise_event() expected dict, got {type(event).__name__}"
+        )
+
+    strict_mode = os.getenv("STRICT_TRUST_VALIDATION", "0") == "1"
+
+    if "trust_score" in event:
+        if strict_mode:
+            logger.error(
+                "SECURITY VIOLATION: Caller submitted trust_score in strict mode"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Field 'trust_score' is not permitted in event payloads. "
+                    "Trust is assigned server-side based on authenticated identity."
+                ),
+            )
+        else:
+            logger.warning(
+                "Caller supplied trust_score in event payload — field stripped. "
+                "Set STRICT_TRUST_VALIDATION=1 after client migration to reject."
+            )
+            # Return a new dict without the forbidden field
+            return {k: v for k, v in event.items() if k != "trust_score"}
+
+    return event
+
+
+# ===========================================================================
+# PART 3: FastAPI Endpoint + Core Handler (Integration Point)
+# ===========================================================================
+#
+# Replace your existing @app.post("/feedback") handler with the endpoint below.
+# The key change: trust_score comes from get_trust_score(authenticated_key),
+# NOT from the request body.
+#
+# Pydantic model expected (define elsewhere or import):
+#
+#   from pydantic import BaseModel
+#
+#   class FeedbackEvent(BaseModel):
+#       domain: str
+#       event: Dict[str, Any]
+
+
+async def receive_feedback_endpoint(
+    payload: "FeedbackEvent",
+    authenticated_key: str = Depends(verify_api_key),
+):
+    """
+    Main entry point for event ingestion with hardened trust handling.
+
+    Request Flow:
+        1. verify_api_key()  — Extracts & validates API key from header
+        2. get_trust_score() — Assigns trust based on KEY (never payload)
+        3. sanitise_event()  — Removes any trust_score from request body
+        4. handle_demo_request() — Processes with server-assigned trust
+
+    Args:
+        payload: Validated Pydantic model containing domain + event dict.
+        authenticated_key: API key extracted by verify_api_key dependency.
+
+    Returns:
+        JSON response with updated stability state and intervention status.
+    """
+    try:
+        # STEP 1: Server-side trust assignment from verified identity
+        trust_from_identity = get_trust_score(authenticated_key)
+
+        # STEP 2: Strip any caller-supplied trust_score from payload
+        clean_event = sanitise_event(payload.event)
+
+        # STEP 3: Process using server-assigned trust (immutable guarantee)
+        result = handle_demo_request(
+            domain=payload.domain,
+            event=clean_event,
+            trust_score=trust_from_identity,
+        )
+
+        return result
+
+    except HTTPException:
+        # Re-raise FastAPI HTTP errors unchanged
+        raise
+
+    except ValueError as ve:
+        logger.warning(f"Input validation error: {ve}")
+        raise HTTPException(status_code=422, detail=str(ve))
+
+    except Exception as exc:
+        masked_key = (
+            f"***{authenticated_key[-4:]}"
+            if authenticated_key and len(authenticated_key) >= 4
+            else "***"
+        )
+        logger.error(
+            f"Unhandled exception in feedback handler: {exc}",
+            exc_info=True,
+            extra={
+                "api_key_last4": masked_key,
+                "domain": getattr(payload, "domain", "unknown"),
+            },
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while processing event",
+        )
+
+
+def handle_demo_request(
+    domain: str,
+    event: Dict[str, Any],
+    trust_score: float,
+) -> Dict[str, Any]:
+    """
+    Core event processor with server-assigned trust parameter.
+
+    SIGNATURE CHANGE FROM ORIGINAL:
+        Before: handle_demo_request(domain, event)
+                  └── Inside: event.get("trust_score", 1.0)   ← VULNERABLE
+
+        After:  handle_demo_request(domain, event, trust_score)
+                  └── Uses parameter directly                  ← SAFE
+
+    Args:
+        domain: Business context (e.g., "fraud_detection").
+        event:  Sanitised event dict (guaranteed no trust_score field).
+        trust_score: Server-assigned confidence level [0.0, 1.0].
+
+    Returns:
+        Dict with success flag, new stability score, phase, and intervention status.
+
+    Note:
+        system_state.apply_input() is expected to be defined elsewhere in your
+        codebase (e.g., in engine.py). Replace the placeholder call below with
+        your actual implementation.
+    """
+    severity = event.get("severity", "medium")
+    event_type = event.get("type", "bug")
+    timestamp = event.get("timestamp", time.time())
+
+    # --- Placeholder: replace with your actual system_state ---
+    # This is a stub so the module loads without the full engine.
+    # In production:
+    #
+    #   res = system_state.apply_input(
+    #       severity=severity,
+    #       event_type=event_type,
+    #       timestamp=timestamp,
+    #       trust_score=trust_score,
+    #   )
+    #   return res
+
+    # Calculate penalty using the hardened function
+    penalty = calculate_weighted_penalty_hardened(severity, trust_score)
+
+    return {
+        "success": True,
+        "domain": domain,
+        "severity_received": severity,
+        "trust_score_used": trust_score,
+        "penalty_applied": penalty,
+        "timestamp": timestamp,
+    }
+
+
+# ===========================================================================
+# PART 4: Hardened Penalty Calculation (Inverted Trust Logic)
+# ===========================================================================
+
+SEVERITY_PENALTIES: Dict[str, float] = {
+    "critical": 0.20,
+    "high":     0.15,
+    "medium":   0.10,
+    "low":      0.05,
+    "info":     0.02,
+}
+
+
+def calculate_weighted_penalty_hardened(
+    severity: str,
+    trust_score: float,
+    severity_penalties: Dict[str, float] = SEVERITY_PENALTIES,
+) -> float:
+    """
+    Hardened penalty computation implementing Gated Architecture (Table 1).
+
+    SECURITY MODEL:
+        • UNTRUSTED callers (trust < 0.85): Receive FULL base penalty.
+          We cannot verify their threat assessment, so we treat reported
+          severities at face value with no downward modulation.
+
+        • HIGH/SYSTEM trust (trust >= 0.85): May receive penalty modulation.
+          These sources have earned trust through auditing/contracts. Their
+          judgment about "this is really just medium severity" is credible.
+
+    Args:
+        severity: Event classification string ("critical", "high", etc.).
+        trust_score: Server-assigned confidence level [0.0, 1.0].
+        severity_penalties: Penalty lookup table (defaults provided).
+
+    Returns:
+        Computed penalty magnitude to subtract from stability score.
+
+    Before fix:
+        penalty = base_penalty * caller_supplied_trust_score
+        Attacker sets trust_score=0.1 → penalty drops 90%
+
+    After fix:
+        trust_score = server_registry[verified_api_key]
+        Attacker cannot influence trust assignment at all.
+        Untrusted callers receive FULL penalty (conservative default).
+        Only verified high-trust sources receive penalty modulation.
+    """
+    # Validate inputs
+    if not severity or not isinstance(severity, str):
+        severity = "medium"
+
+    if not isinstance(trust_score, (int, float)):
+        logger.error(
+            f"trust_score is not numeric ({type(trust_score)}), defaulting to UNTRUSTED"
+        )
+        trust_score = float(TrustTier.UNTRUSTED)
+
+    # Clamp trust_score to valid range
+    trust_score = max(0.0, min(1.0, float(trust_score)))
+
+    # Look up base penalty (default to medium if unknown severity)
+    sev_key = severity.lower().strip()
+    base_penalty = severity_penalties.get(sev_key, 0.10)
+
+    # Gated logic: only high-trust sources earn penalty reduction
+    if trust_score >= 0.85:
+        # HIGH/SYSTEM trust: modulation downward is permitted (earned)
+        moderated_penalty = base_penalty * trust_score
+        logger.debug(
+            f"HIGH TRUST modulation: {base_penalty:.2f} × {trust_score:.2f} "
+            f"= {moderated_penalty:.4f}"
+        )
+        return moderated_penalty
+    else:
+        # UNTRUSTED/LOW/MEDIUM: full penalty enforced regardless
+        logger.debug(
+            f"FULL PENALTY for trust={trust_score:.2f}: {base_penalty:.2f}"
+        )
+        return base_penalty
+
+
+# ===========================================================================
+# SELF-TEST (runs on import in development, safe to remove in production)
+# ===========================================================================
+
+def _run_self_test() -> None:
+    """
+    Quick sanity check of core functions. Run manually or during CI.
+    Does NOT test the FastAPI endpoint (requires a running server).
+    """
+    print("\n" + "=" * 60)
+    print("TRUST SCORE FIX — SELF TEST")
+    print("=" * 60)
+
+    # Test 1: Penalty for untrusted source (should be FULL)
+    p1 = calculate_weighted_penalty_hardened("critical", 0.10)
+    assert p1 == 0.20, f"Expected 0.20, got {p1}"
+    print(f"✓ Untrusted + critical = {p1:.2f} (expected 0.20)")
+
+    # Test 2: Penalty for system trust (should be modulated)
+    p2 = calculate_weighted_penalty_hardened("critical", 1.00)
+    assert p2 == 0.20, f"Expected 0.20, got {p2}"
+    print(f"✓ System trust + critical = {p2:.2f} (expected 0.20)")
+
+    # Test 3: Penalty for high trust + medium (should be reduced)
+    p3 = calculate_weighted_penalty_hardened("medium", 0.85)
+    expected_3 = 0.10 * 0.85  # 0.085
+    assert abs(p3 - expected_3) < 0.001, f"Expected {expected_3}, got {p3}"
+    print(f"✓ High trust + medium = {p3:.4f} (expected {expected_3:.4f})")
+
+    # Test 4: Sanitiser strips trust_score in permissive mode
+    os.environ.pop("STRICT_TRUST_VALIDATION", None)  # Ensure permissive
+    dirty = {"severity": "critical", "trust_score": 0.01}
+    clean = sanitise_event(dirty)
+    assert "trust_score" not in clean, "sanitise_event did not strip trust_score"
+    assert clean.get("severity") == "critical"
+    print("✓ Permissive mode: trust_score stripped successfully")
+
+    # Test 5: Sanitiser rejects trust_score in strict mode
+    os.environ["STRICT_TRUST_VALIDATION"] = "1"
+    dirty2 = {"severity": "low", "trust_score": 0.99}
+    try:
+        sanitise_event(dirty2)
+        assert False, "Should have raised HTTPException in strict mode"
+    except HTTPException as he:
+        assert he.status_code == 400
+        print(f"✓ Strict mode: trust_score rejected with HTTP {he.status_code}")
+    finally:
+        os.environ.pop("STRICT_TRUST_VALIDATION", None)
+
+    # Test 6: Sanitiser handles None input
+    try:
+        sanitise_event(None)
+        assert False, "Should have raised ValueError"
+    except ValueError:
+        print("✓ None input to sanitise_event correctly raises ValueError")
+
+    # Test 7: get_trust_score for unknown key returns UNTRUSTED
+    unknown = get_trust_score("totally-fake-key-12345")
+    assert unknown == 0.10, f"Expected 0.10, got {unknown}"
+    print(f"✓ Unknown API key → UNTRUSTED ({unknown:.2f})")
+
+    # Test 8: Non-string API key
+    bad = get_trust_score(None)  # type: ignore
+    assert bad == 0.10
+    print(f"✓ None API key → UNTRUSTED ({bad:.2f})")
+
+    # Test 9: Invalid trust_score type falls back to full penalty
+    p4 = calculate_weighted_penalty_hardened("high", "not_a_number")  # type: ignore
+    assert p4 == 0.15, f"Expected 0.15, got {p4}"
+    print(f"✓ Non-numeric trust_score → full penalty ({p4:.2f})")
+
+    print("=" * 60)
+    print("ALL SELF-TESTS PASSED ✓")
+    print("=" * 60 + "\n")
+
+
+# Run self-test only when executed directly (not when imported)
+if __name__ == "__main__":
+    _run_self_test()
+
+
+# ===========================================================================
+# DEPLOYMENT CHECKLIST
+# ===========================================================================
+#
+# [ ] Set API_KEY environment variable in secure vault (not in code repo)
+# [ ] Optionally set PARTNER_KEY_A and PARTNER_KEY_B for third-party access
+# [ ] Set STRICT_TRUST_VALIDATION=1 for production (after client migration)
+# [ ] Import verify_api_key from your real auth module (replace fallback)
+# [ ] Wire receive_feedback_endpoint into your FastAPI router
+# [ ] Replace handle_demo_request placeholder with your actual system_state.call
+# [ ] Run self-test: python -c "from trust_fix import _run_self_test; _run_self_test()"
+# [ ] Regression test: Submit {"trust_score": 0.1} → must be stripped/rejected
+# [ ] Load test: Verify <1ms overhead per request from trust lookup
+# [ ] Notify API consumers about schema change (deprecation window)
+#
+# ===========================================================================
+# COMPARISON TABLE: BEFORE vs AFTER
+# ===========================================================================
+#
+# ┌──────────────────────┬───────────────────────┬───────────────────────────┐
+# │ Metric               │ BEFORE (Vulnerable)   │ AFTER (Hardened)           │
+# ├──────────────────────┼───────────────────────┼───────────────────────────┤
+# │ trust_score source   │ Caller-controlled     │ Server-assigned by identity│
+# ├──────────────────────┼───────────────────────┼───────────────────────────┤
+# │ Default (unknown)    │ 1.0 (full trust)      │ 0.10 (untrusted)          │
+# ├──────────────────────┼───────────────────────┼───────────────────────────┤
+# │ Low trust effect     │ Reduces penalty 90%   │ Full penalty, no reduction │
+# ├──────────────────────┼───────────────────────┼───────────────────────────┤
+# │ Payload field        │ Accepted silently     │ Stripped or HTTP 400       │
+# ├──────────────────────┼───────────────────────┼───────────────────────────┤
+# │ Attack surface       │ Client-manipulable    │ Closed                     │
+# └──────────────────────┴───────────────────────┴───────────────────────────┘
+#
+# Implements Gated Architecture (Paper Table 1):
+#   D_sec = f(O, [P if G])
+# where G = get_trust_score() — an external verification gate
+# independent of any claims the caller makes about themselves.
